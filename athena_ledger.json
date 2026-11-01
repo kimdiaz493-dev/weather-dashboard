@@ -1,0 +1,501 @@
+#!/usr/bin/env python3
+"""Athena Deep-Space Command Deck web app."""
+
+import json
+import os
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+PORT = int(os.environ.get("PORT", 8080))
+LEDGER_PATH = os.path.join(os.path.dirname(__file__), "athena_ledger.json")
+
+
+def get_ledger():
+    if os.path.exists(LEDGER_PATH):
+        try:
+            with open(LEDGER_PATH, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+                if isinstance(data, dict):
+                    data.setdefault("total_revenue", 0.0)
+                    data.setdefault("active_tenants", [])
+                    return data
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {"total_revenue": 0.0, "active_tenants": []}
+
+
+HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>Athena Deep-Space Command Deck</title>
+  <style>
+    :root {
+      --bg: #020617;
+      --panel: rgba(15, 23, 42, 0.8);
+      --cyan: #38bdf8;
+      --cyan-dark: #0369a1;
+      --green: #4ade80;
+      --red: #ef4444;
+      --muted: #94a3b8;
+      --line: #1e293b;
+    }
+
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: var(--bg);
+      color: var(--cyan);
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+    }
+
+    #scene {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      display: block;
+      background: radial-gradient(circle at center, rgba(10, 21, 34, 0.9), rgba(2, 6, 23, 1) 55%);
+    }
+
+    #hud {
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      z-index: 5;
+      width: min(360px, calc(100% - 24px));
+      padding: 14px 14px 12px;
+      border: 1px solid var(--cyan-dark);
+      border-radius: 12px;
+      background: var(--panel);
+      backdrop-filter: blur(6px);
+      box-shadow: 0 0 18px rgba(56, 189, 248, 0.2);
+    }
+
+    h1 {
+      margin: 0 0 6px;
+      font-size: 16px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--cyan);
+      text-shadow: 0 0 10px rgba(56, 189, 248, 0.8);
+    }
+
+    .status-line {
+      font-size: 12px;
+      color: var(--muted);
+      line-height: 1.6;
+    }
+
+    .status-line .ok { color: var(--green); }
+    .status-line .info { color: var(--cyan); }
+
+    .button-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 10px;
+    }
+
+    button {
+      appearance: none;
+      border: 1px solid var(--cyan);
+      background: var(--cyan-dark);
+      color: #fff;
+      border-radius: 8px;
+      padding: 8px 12px;
+      font: inherit;
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      cursor: pointer;
+      transition: transform 0.12s ease, filter 0.12s ease;
+    }
+
+    button:hover { filter: brightness(1.08); }
+    button:active { transform: translateY(1px); }
+    button.danger { background: #b91c1c; border-color: #ef4444; }
+    button.success { background: #15803d; border-color: #22c55e; }
+
+    #telemetry {
+      margin-top: 10px;
+      min-height: 76px;
+      max-height: 90px;
+      overflow: auto;
+      white-space: pre-wrap;
+      font-size: 11px;
+      line-height: 1.5;
+      color: var(--muted);
+      border-top: 1px solid rgba(56, 189, 248, 0.3);
+      padding-top: 8px;
+    }
+
+    #controls-hint {
+      position: absolute;
+      left: 0;
+      right: 0;
+      bottom: 16px;
+      text-align: center;
+      font-size: 11px;
+      letter-spacing: 0.08em;
+      color: #64748b;
+      z-index: 5;
+      pointer-events: none;
+      text-transform: uppercase;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="scene"></canvas>
+
+  <div id="hud">
+    <h1>👑 Athena Deep-Space Deck</h1>
+    <div class="status-line">
+      CORE: <span class="ok">ONLINE</span> |
+      DEFENSE: <span class="info">FORTIFIED</span>
+    </div>
+
+    <div class="button-row">
+      <button onclick="voice('Status normal. Fleet operational.'); sendCommand('/status')">📊 STATUS</button>
+      <button class="danger" onclick="voice('Shields up. Argus sweep active.'); sendCommand('/defend')">🛡️ DEFEND</button>
+      <button class="success" onclick="voice('Accessing ledger records.'); sendCommand('/finance')">💰 LEDGER</button>
+    </div>
+
+    <div id="telemetry">Touch &amp; drag to rotate orbital deck. Tap buttons for audio-visual telemetry.</div>
+  </div>
+
+  <div id="controls-hint">One-finger drag: orbit | two-finger pinch: zoom</div>
+
+  <script>
+    const canvas = document.getElementById('scene');
+    const ctx = canvas.getContext('2d');
+    const telemetry = document.getElementById('telemetry');
+
+    const state = {
+      width: window.innerWidth,
+      height: window.innerHeight,
+      rotY: 0,
+      rotX: 0.4,
+      zoom: 1,
+      dragging: false,
+      lastX: 0,
+      lastY: 0,
+      lastPinchDistance: null,
+      particles: []
+    };
+
+    function setCanvasSize() {
+      state.width = window.innerWidth;
+      state.height = window.innerHeight;
+      canvas.width = state.width * window.devicePixelRatio;
+      canvas.height = state.height * window.devicePixelRatio;
+      ctx.setTransform(window.devicePixelRatio, 0, 0, window.devicePixelRatio, 0, 0);
+    }
+
+    function voice(msg) {
+      if ('speechSynthesis' in window) {
+        const utterance = new SpeechSynthesisUtterance(msg);
+        utterance.rate = 1.0;
+        utterance.pitch = 1.1;
+        window.speechSynthesis.cancel();
+        window.speechSynthesis.speak(utterance);
+      }
+    }
+
+    function sendCommand(path) {
+      const message = 'Directing ' + path.replace('/', '') + ' across mesh...';
+      telemetry.textContent = message;
+      fetch(path)
+        .then((response) => response.text())
+        .then((text) => {
+          telemetry.textContent = text;
+        })
+        .catch(() => {
+          telemetry.textContent = 'Telemetry uplink unavailable.';
+        });
+    }
+
+    function buildParticles() {
+      const count = 120;
+      state.particles = [];
+      for (let i = 0; i < count; i += 1) {
+        state.particles.push({
+          radius: 0.8 + Math.random() * 2.2,
+          angle: Math.random() * Math.PI * 2,
+          orbit: 70 + Math.random() * 180,
+          speed: 0.003 + Math.random() * 0.01,
+          alpha: 0.25 + Math.random() * 0.75,
+          x: 0,
+          y: 0,
+          color: i % 4 === 0 ? '#38bdf8' : i % 4 === 1 ? '#4ade80' : i % 4 === 2 ? '#a855f7' : '#ef4444'
+        });
+      }
+    }
+
+    function drawBackground() {
+      const gradient = ctx.createRadialGradient(
+        state.width * 0.5,
+        state.height * 0.5,
+        20,
+        state.width * 0.5,
+        state.height * 0.5,
+        state.width * 0.8
+      );
+      gradient.addColorStop(0, 'rgba(14, 23, 36, 0.8)');
+      gradient.addColorStop(1, 'rgba(2, 6, 23, 1)');
+      ctx.fillStyle = gradient;
+      ctx.fillRect(0, 0, state.width, state.height);
+    }
+
+    function projectPoint(x, y, z) {
+      const cosY = Math.cos(state.rotY);
+      const sinY = Math.sin(state.rotY);
+      const cosX = Math.cos(state.rotX);
+      const sinX = Math.sin(state.rotX);
+
+      const x1 = x * cosY - z * sinY;
+      const z1 = x * sinY + z * cosY;
+      const y1 = y * cosX - z1 * sinX;
+      const z2 = y * sinX + z1 * cosX;
+
+      const focal = 540;
+      const scale = focal / (focal + z2);
+      return {
+        x: state.width / 2 + x1 * scale * state.zoom,
+        y: state.height / 2 + y1 * scale * state.zoom,
+        scale,
+        z: z2
+      };
+    }
+
+    function drawOrbitRing(radius, color, lineWidth, offset = 0) {
+      ctx.beginPath();
+      ctx.lineWidth = lineWidth;
+      ctx.strokeStyle = color;
+      for (let i = 0; i <= 400; i += 1) {
+        const angle = (i / 400) * (Math.PI * 2) + offset;
+        const x = Math.cos(angle) * radius;
+        const z = Math.sin(angle) * radius;
+        const point = projectPoint(x, 0, z);
+        if (i === 0) {
+          ctx.moveTo(point.x, point.y);
+        } else {
+          ctx.lineTo(point.x, point.y);
+        }
+      }
+      ctx.stroke();
+    }
+
+    function drawCore() {
+      const center = projectPoint(0, 0, 0);
+      const coreRadius = 46;
+
+      ctx.beginPath();
+      ctx.fillStyle = 'rgba(56, 189, 248, 0.12)';
+      ctx.arc(center.x, center.y, coreRadius, 0, Math.PI * 2);
+      ctx.fill();
+
+      ctx.beginPath();
+      ctx.lineWidth = 1.4;
+      ctx.strokeStyle = 'rgba(56, 189, 248, 0.85)';
+      ctx.arc(center.x, center.y, coreRadius, 0, Math.PI * 2);
+      ctx.stroke();
+
+      for (let i = 0; i < 3; i += 1) {
+        const orbit = 18 + i * 18;
+        ctx.beginPath();
+        ctx.strokeStyle = 'rgba(56, 189, 248, 0.35)';
+        ctx.lineWidth = 1;
+        for (let j = 0; j <= 120; j += 1) {
+          const angle = (j / 120) * Math.PI * 2;
+          const x = Math.cos(angle) * orbit;
+          const y = Math.sin(angle) * (orbit * 0.55);
+          const p = projectPoint(x, y, 0);
+          if (j === 0) ctx.moveTo(p.x, p.y);
+          else ctx.lineTo(p.x, p.y);
+        }
+        ctx.stroke();
+      }
+    }
+
+    function drawBots() {
+      const names = ['ARGUS-SEC', 'HERMES-FIN', 'NEXUS-DATA', 'VORTEX-OPS'];
+      const colors = ['#ef4444', '#22c55e', '#38bdf8', '#a855f7'];
+
+      for (let i = 0; i < names.length; i += 1) {
+        const angle = (i / names.length) * Math.PI * 2 + performance.now() * 0.00024;
+        const x = Math.cos(angle) * (150 + i * 28);
+        const y = Math.sin(angle * 1.7) * 25;
+        const z = Math.sin(angle) * (150 + i * 28);
+        const p = projectPoint(x, y, z);
+
+        ctx.fillStyle = colors[i];
+        ctx.fillRect(p.x - 8, p.y - 8, 16, 16);
+
+        ctx.fillStyle = 'rgba(255,255,255,0.75)';
+        ctx.font = '10px monospace';
+        ctx.fillText(names[i], p.x + 12, p.y + 4);
+      }
+    }
+
+    function drawParticles() {
+      for (const p of state.particles) {
+        p.angle += p.speed;
+        const x = Math.cos(p.angle) * p.orbit;
+        const y = Math.sin(p.angle * 1.5) * 150;
+        const z = Math.sin(p.angle) * p.orbit;
+        const point = projectPoint(x, y, z);
+
+        ctx.beginPath();
+        ctx.fillStyle = p.color.replace(')', ', ' + p.alpha + ')').replace('rgb', 'rgba');
+        if (!p.color.startsWith('#')) {
+          ctx.fillStyle = p.color;
+        }
+        ctx.arc(point.x, point.y, p.radius, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+
+    function render() {
+      drawBackground();
+      drawOrbitRing(150, 'rgba(56, 189, 248, 0.8)', 1.2, 0.45);
+      drawOrbitRing(215, 'rgba(2, 132, 199, 0.7)', 1, 1.2);
+      drawOrbitRing(260, 'rgba(56, 189, 248, 0.45)', 0.8, 2.4);
+      drawCore();
+      drawBots();
+      drawParticles();
+      requestAnimationFrame(render);
+    }
+
+    function handlePointerDown(event) {
+      state.dragging = true;
+      state.lastX = event.clientX;
+      state.lastY = event.clientY;
+    }
+
+    function handlePointerMove(event) {
+      if (!state.dragging) return;
+      const dx = event.clientX - state.lastX;
+      const dy = event.clientY - state.lastY;
+      state.lastX = event.clientX;
+      state.lastY = event.clientY;
+      state.rotY += dx * 0.008;
+      state.rotX += dy * 0.008;
+      state.rotX = Math.max(-1.4, Math.min(1.4, state.rotX));
+    }
+
+    function handlePointerUp() {
+      state.dragging = false;
+    }
+
+    function handleTouchStart(event) {
+      if (event.touches.length === 1) {
+        handlePointerDown(event.touches[0]);
+      } else if (event.touches.length === 2) {
+        const [a, b] = event.touches;
+        state.lastPinchDistance = Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
+      }
+    }
+
+    function handleTouchMove(event) {
+      if (event.touches.length === 1) {
+        handlePointerMove(event.touches[0]);
+      } else if (event.touches.length === 2 && state.lastPinchDistance) {
+        const [a, b] = event.touches;
+        const dist = Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
+        const delta = dist - state.lastPinchDistance;
+        state.zoom = Math.max(0.7, Math.min(1.9, state.zoom + delta * 0.0015));
+        state.lastPinchDistance = dist;
+      }
+    }
+
+    function handleTouchEnd() {
+      state.dragging = false;
+      state.lastPinchDistance = null;
+    }
+
+    canvas.addEventListener('pointerdown', handlePointerDown);
+    canvas.addEventListener('pointermove', handlePointerMove);
+    canvas.addEventListener('pointerup', handlePointerUp);
+    canvas.addEventListener('pointerleave', handlePointerUp);
+    canvas.addEventListener('touchstart', handleTouchStart, { passive: true });
+    canvas.addEventListener('touchmove', handleTouchMove, { passive: true });
+    canvas.addEventListener('touchend', handleTouchEnd, { passive: true });
+    window.addEventListener('resize', setCanvasSize);
+
+    setCanvasSize();
+    buildParticles();
+    requestAnimationFrame(render);
+  </script>
+</body>
+</html>
+"""
+
+
+class AthenaHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path in ("/", "/index.html"):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(HTML.encode("utf-8"))
+            return
+
+        if self.path == "/status":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(b"ORBITAL DECK TELEMETRY: All 4 tactical bot nodes synchronized.")
+            return
+
+        if self.path == "/defend":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(b"DEFENSE PROTOCOL ACTIVE: Perimeter shields energized.")
+            return
+
+        if self.path == "/finance":
+            ledger = get_ledger()
+            active = ", ".join(ledger.get("active_tenants", [])) if ledger.get("active_tenants") else "NONE"
+            payload = (
+                f"TREASURY: ${ledger.get('total_revenue', 0.0):.2f} | "
+                f"ACTIVE TENANTS: {active}"
+            )
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(payload.encode("utf-8"))
+            return
+
+        if self.path == "/ledger":
+            ledger = get_ledger()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(json.dumps(ledger, indent=2).encode("utf-8"))
+            return
+
+        self.send_response(404)
+        self.end_headers()
+
+    def log_message(self, format, *args):
+        return
+
+
+if __name__ == "__main__":
+    print(f"Starting Athena Deep-Space Command Deck on port {PORT}...")
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), AthenaHandler)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nShutting down Athena server.")
+    finally:
+        server.server_close()
+
+
+"""
+},{
